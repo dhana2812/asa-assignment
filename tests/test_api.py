@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
+import models  # noqa: E402
 
 TEST_DB_URL = "sqlite:///./test_vulntracker.db"
 engine = create_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
@@ -148,3 +150,155 @@ def test_delete_scan():
 
     resp = client.delete(f"/scans/{scan_id}", headers=auth_headers(token))
     assert resp.status_code == 204
+
+
+def test_share_scan_without_password():
+    token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Shared finding",
+        "severity": "high",
+        "affected_component": "GET /report",
+    }, headers=auth_headers(token)).json()["id"]
+
+    share_resp = client.post(
+        f"/scans/{scan_id}/share",
+        headers=auth_headers(token),
+    )
+    assert share_resp.status_code == 200
+    share_url = share_resp.json()["share_url"]
+    assert share_url.startswith("http://localhost:8000/share/")
+
+    scan_resp = client.get(share_url.removeprefix("http://localhost:8000"))
+    assert scan_resp.status_code == 200
+    assert scan_resp.json()["title"] == "Shared finding"
+
+
+def test_share_scan_requires_password_when_configured():
+    token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Protected finding",
+        "severity": "critical",
+        "affected_component": "POST /login",
+    }, headers=auth_headers(token)).json()["id"]
+    share_url = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": "stakeholder-secret"},
+        headers=auth_headers(token),
+    ).json()["share_url"]
+    path = share_url.removeprefix("http://localhost:8000")
+
+    assert client.get(path).status_code == 403
+    assert client.get(path, params={"password": "wrong-password"}).status_code == 403
+    assert client.get(path, params={"password": "x" * 73}).status_code == 403
+    response = client.get(path, params={"password": "stakeholder-secret"})
+    assert response.status_code == 200
+    assert response.json()["title"] == "Protected finding"
+
+
+def test_share_link_expires_after_24_hours():
+    token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Expired finding",
+        "severity": "low",
+        "affected_component": "worker",
+    }, headers=auth_headers(token)).json()["id"]
+    share_url = client.post(
+        f"/scans/{scan_id}/share",
+        headers=auth_headers(token),
+    ).json()["share_url"]
+
+    db = TestingSessionLocal()
+    try:
+        share_link = db.query(models.ShareLink).first()
+        assert share_link.expires_at <= datetime.utcnow() + timedelta(hours=24)
+        assert share_link.expires_at > datetime.utcnow() + timedelta(hours=23, minutes=59)
+        share_link.expires_at = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(share_url.removeprefix("http://localhost:8000"))
+    assert response.status_code == 404
+
+
+def test_cannot_share_another_users_scan():
+    owner_token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Private finding",
+        "severity": "medium",
+        "affected_component": "worker",
+    }, headers=auth_headers(owner_token)).json()["id"]
+    other_user_token = register_and_login("bob", "bob@example.com", "secret")
+
+    response = client.post(
+        f"/scans/{scan_id}/share",
+        headers=auth_headers(other_user_token),
+    )
+    assert response.status_code == 404
+
+
+def test_share_nonexistent_scan_returns_404():
+    token = register_and_login()
+    response = client.post("/scans/99999/share", headers=auth_headers(token))
+    assert response.status_code == 404
+
+
+def test_share_scan_unauthenticated_returns_401():
+    response = client.post("/scans/1/share")
+    assert response.status_code in (401, 403)
+
+
+def test_share_invalid_password_returns_422():
+    token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Validation finding",
+        "severity": "low",
+        "affected_component": "worker",
+    }, headers=auth_headers(token)).json()["id"]
+
+    # Empty password
+    empty_resp = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": ""},
+        headers=auth_headers(token),
+    )
+    assert empty_resp.status_code == 422
+
+    # Password exceeding 72 bytes
+    long_resp = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": "a" * 73},
+        headers=auth_headers(token),
+    )
+    assert long_resp.status_code == 422
+
+
+def test_get_share_nonexistent_token_returns_404():
+    response = client.get("/share/completely_non_existent_token_12345")
+    assert response.status_code == 404
+
+
+def test_delete_scan_cascades_and_removes_share_link():
+    token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Cascade finding",
+        "severity": "medium",
+        "affected_component": "worker",
+    }, headers=auth_headers(token)).json()["id"]
+
+    share_url = client.post(
+        f"/scans/{scan_id}/share",
+        headers=auth_headers(token),
+    ).json()["share_url"]
+    path = share_url.removeprefix("http://localhost:8000")
+
+    # Verify link works
+    assert client.get(path).status_code == 200
+
+    # Delete scan
+    del_resp = client.delete(f"/scans/{scan_id}", headers=auth_headers(token))
+    assert del_resp.status_code == 204
+
+    # Share link should now return 404
+    assert client.get(path).status_code == 404
+

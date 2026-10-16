@@ -1,6 +1,8 @@
+import hashlib
 import logging
+import secrets
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import httpx
@@ -107,9 +109,17 @@ class ScanOut(BaseModel):
         from_attributes = True
 
 
+class ShareCreate(BaseModel):
+    password: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _hash_share_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
 
 def _fire_notify(event: str, payload: dict) -> None:
     try:
@@ -197,6 +207,85 @@ def create_scan(
         "severity": scan.severity,
         "owner": current_user.username,
     })
+    return scan
+
+
+@app.post(
+    "/scans/{scan_id}/share",
+    summary="Generate a shared report link",
+    response_description="A unique expiring share URL",
+)
+def create_share_link(
+    scan_id: int,
+    payload: Optional[ShareCreate] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Generate a 24-hour expiring shareable link for a scan report.
+    Only the owner of the scan can generate a share link.
+    Optionally accepts a password to protect the report.
+    """
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == scan_id,
+        models.ScanResult.owner_id == current_user.id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    password = payload.password if payload is not None else None
+    if password is not None and (
+        not password or len(password.encode("utf-8")) > 72
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="password must contain between 1 and 72 UTF-8 bytes",
+        )
+
+    token = secrets.token_urlsafe(32)
+    share_link = models.ShareLink(
+        token_hash=_hash_share_token(token),
+        password_hash=get_password_hash(password) if password is not None else None,
+        scan_id=scan.id,
+        expires_at=datetime.utcnow() + timedelta(hours=24),
+    )
+    db.add(share_link)
+    db.commit()
+    return {"share_url": f"http://localhost:8000/share/{token}"}
+
+
+@app.get(
+    "/share/{token}",
+    response_model=ScanOut,
+    summary="Access a shared scan report",
+    response_description="Scan finding details",
+)
+def get_shared_scan(
+    token: str,
+    password: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Publicly retrieve a shared scan finding using its unique share token.
+    Enforces a strict 24-hour expiration window.
+    If the link is password-protected, requires the correct `password` query parameter.
+    """
+    share_link = db.query(models.ShareLink).filter(
+        models.ShareLink.token_hash == _hash_share_token(token),
+    ).first()
+    if not share_link or share_link.expires_at <= datetime.utcnow():
+        raise HTTPException(status_code=404, detail="Share link not found or expired")
+    if share_link.password_hash is not None and (
+        password is None
+        or len(password.encode("utf-8")) > 72
+        or not verify_password(password, share_link.password_hash)
+    ):
+        raise HTTPException(status_code=403, detail="Password required or incorrect")
+
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == share_link.scan_id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Shared scan not found")
     return scan
 
 

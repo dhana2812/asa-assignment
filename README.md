@@ -52,6 +52,14 @@ uvicorn main:app --reload
 
 Available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
 
+### Shared report links
+
+Authenticated scan owners can create a public report link with
+`POST /scans/{scan_id}/share`, optionally passing `{"password": "..."}`. The
+returned `share_url` uses the fixed prototype origin `http://localhost:8000`;
+the link expires 24 hours after creation. A protected link requires the
+password as a `password` query parameter on `GET /share/{token}`.
+
 Run the Python test suite from the **repo root**:
 
 ```bash
@@ -93,6 +101,44 @@ Add the following endpoints to the app:
 | `GET`  | `/share/{token}`         | None (public) | Return the scan data if the token is valid and not expired. If password-protected, require a `password` query parameter. |
 
 Implementation choices are yours. We will read and evaluate the code you write here — including the security properties of your implementation. For the `share_url` value, use the incoming request's host, or hard-code `http://localhost:8000` for the prototype — document whichever you choose.
+
+#### Task 1 Implementation & Security Architecture Documentation
+
+##### Endpoints & API Specification
+- `POST /scans/{scan_id}/share`
+  - **Auth**: Bearer token (`get_current_user`).
+  - **Request Body (JSON, Optional)**: `{ "password": "optional_password" }`
+  - **Response (200 OK)**: `{ "share_url": "http://localhost:8000/share/<token>" }`
+  - **Error Responses**:
+    - `401 Unauthorized`: Missing or invalid Bearer token.
+    - `404 Not Found`: Scan not found or scan does not belong to the authenticated user.
+    - `422 Unprocessable Entity`: Password empty or exceeds 72 UTF-8 bytes.
+- `GET /share/{token}`
+  - **Auth**: None (Publicly accessible).
+  - **Query Parameters**: `password` (optional string, required only if link is password-protected).
+  - **Response (200 OK)**: `ScanOut` JSON payload.
+  - **Error Responses**:
+    - `403 Forbidden`: Link is password-protected and password was missing, incorrect, or invalid length.
+    - `404 Not Found`: Token does not exist or has expired (> 24 hours).
+
+##### Key Security Properties & Design Decisions
+- **CSPRNG High-Entropy Token Generation**:
+  Tokens are generated using Python's `secrets.token_urlsafe(32)`, providing 256 bits of cryptographic entropy. This prevents token guessing and brute-force enumeration.
+- **Hashed Token Storage at Rest**:
+  The raw token is returned once to the caller in `share_url` and is **never stored in plaintext** in the database. Instead, the database stores the SHA-256 hash (`token_hash`) of the token with a unique index. In the event of a database breach or SQL injection compromise, an attacker cannot retrieve or use active share links.
+- **Salted Adaptive Password Hashing**:
+  When password protection is enabled, the password is encrypted using `passlib` bcrypt hashing (`pwd_context.hash`). Bcrypt employs an adaptive cost factor and automatic salt generation, protecting passwords against offline dictionary and rainbow-table attacks.
+- **Bcrypt Boundary Enforcement**:
+  Bcrypt algorithms truncate inputs at 72 bytes. The API enforces validation (`1 <= len(password.encode("utf-8")) <= 72`), preventing truncation bypasses and unexpected authentication flaws.
+- **IDOR and Information Disclosure Prevention**:
+  `POST /scans/{scan_id}/share` queries `ScanResult` filtering by `owner_id == current_user.id`. If a user attempts to share a scan belonging to another tenant or non-existent ID, the endpoint uniformly returns `404 Not Found` rather than `403 Forbidden`, preventing scan ID enumeration.
+- **Uniform Expired Link Invalidation**:
+  `GET /share/{token}` checks `expires_at <= datetime.utcnow()`. Both expired tokens and non-existent tokens return `404 Not Found` with identical error responses to prevent oracle-based state probing.
+- **Cascade Deletion Lifecycle**:
+  `ShareLink` is bound to `ScanResult` with foreign key `ondelete="CASCADE"` and SQLAlchemy `cascade="all, delete-orphan"`. When a scan is deleted by its owner, all active share links are automatically cleaned up, eliminating orphan access tokens and database integrity violations.
+- **Prototype `share_url` Origin Decision**:
+  The prototype uses the explicit fixed origin `http://localhost:8000`. Relying on incoming `Host` or `X-Forwarded-Host` headers without strict domain allowlisting exposes applications to Host Header Injection, Web Cache Poisoning, and phishing redirect vectors. In production environments, this origin is configured via an environment variable (e.g. `APP_BASE_URL`) or validated against a trusted domain whitelist.
+
 
 ---
 
