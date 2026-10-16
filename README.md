@@ -207,6 +207,75 @@ Add either a `terraform/` or `helm/` directory (your choice) that could deploy t
 - Restrict network ingress to only what is required
 - Define resource limits and security contexts
 
+#### Task 4 Implementation & Deployment Documentation
+
+##### Docker Build and Run Instructions
+
+The Python FastAPI application is fully containerized using a production-grade, multi-stage Dockerfile adhering to DevSecOps best practices.
+
+###### 1. Build the Container Image
+Execute from the repository root:
+```bash
+docker build -t vulntracker-api:latest .
+```
+
+###### 2. Run the Container
+Run the container in detached mode, exposing port 8000:
+```bash
+docker run -d \
+  --name vulntracker-api \
+  -p 8000:8000 \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  vulntracker-api:latest
+```
+
+###### 3. Verify Health and Reachability
+Check container status and query the integrated health check:
+```bash
+# Check container status (shows "(healthy)")
+docker ps -f name=vulntracker-api
+
+# Query API health endpoint
+curl -s http://localhost:8000/health
+# Expected Output: {"status":"ok","service":"vulntracker-api"}
+
+# Query OpenAPI Swagger documentation
+curl -I http://localhost:8000/docs
+# Expected Output: HTTP/1.1 200 OK
+```
+
+###### 4. Stop and Clean Up
+```bash
+docker stop vulntracker-api && docker rm vulntracker-api
+```
+
+##### Container Security Controls Implemented
+1. **Minimal, Pinned Base Image**: Uses `python:3.11-slim-bookworm` pinned to a specific Debian release, minimizing the attack surface and package footprint.
+2. **Multi-Stage Build Pattern**: Stage 1 (`builder`) installs build dependencies (`gcc`, `libffi-dev`) and compiles wheels into `/install/wheels`. Stage 2 (`runtime`) copies only pre-built wheels and application source code, omitting all compilers and package caches from the final image.
+3. **Dedicated Non-Root User Execution**: Creates an unprivileged group and user (`appgroup:appuser`, `UID:GID 10001:10001`) with no shell (`/sbin/nologin`). Application processes execute strictly under `USER 10001:10001`.
+4. **Native Container `HEALTHCHECK`**: Employs Python's built-in `urllib.request` library (`python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"`) to verify liveness every 30 seconds without requiring external utilities like `curl` or `wget`.
+5. **Zero Embedded Secrets or Credentials**: No API keys, passwords, or tokens are embedded in the Dockerfile, layers, or environment variables. All secrets are injected dynamically at runtime.
+
+##### Cloud Infrastructure Architecture (`terraform/`)
+The deployment configuration in [`terraform/`](file:///c:/Users/dhana/asa-assignment/terraform/) provisions a secure, production-grade AWS ECS Fargate deployment:
+
+1. **Secrets Management via AWS Secrets Manager & KMS ([`terraform/secrets.tf`](file:///c:/Users/dhana/asa-assignment/terraform/secrets.tf))**:
+   - Application secrets (`SECRET_KEY`, `DB_PASSWORD`) are stored in AWS Secrets Manager and encrypted with a dedicated customer-managed AWS KMS key with automatic 30-day key rotation enabled (`enable_key_rotation = true`).
+   - Secrets are injected into the ECS container definition via direct Secrets Manager ARN references (`valueFrom = "${aws_secretsmanager_secret.app_secrets.arn}:KEY::"`). No secrets exist in plaintext manifests or static configuration files.
+2. **Strict Network Ingress & Egress Isolation ([`terraform/security_groups.tf`](file:///c:/Users/dhana/asa-assignment/terraform/security_groups.tf))**:
+   - **ALB Security Group**: Accepts inbound traffic strictly on HTTPS port 443 from external clients.
+   - **ECS Tasks Security Group**: Accepts inbound traffic strictly from the Application Load Balancer security group on port 8000. **Direct internet ingress is completely prohibited**.
+   - ECS tasks are deployed across private subnets without public IPv4 addresses.
+3. **Resource Limits & Hardened Security Contexts ([`terraform/main.tf`](file:///c:/Users/dhana/asa-assignment/terraform/main.tf))**:
+   - **Resource Limits**: Pinned task execution constraints: `cpu = 256` (0.25 vCPU) and `memory = 512` (512 MiB), preventing resource exhaustion and Denial-of-Service attacks.
+   - **Read-Only Root Filesystem**: `readonlyRootFilesystem = true` prevents runtime file tampering, webshell persistence, and unauthorized modifications. A dedicated temporary in-memory volume is mounted at `/tmp` for ephemeral database and cache writes.
+   - **Dropped Linux Kernel Capabilities**: `linuxParameters.capabilities.drop = ["ALL"]` eliminates all privileged Linux capabilities, neutralizing privilege escalation attacks.
+   - **Non-Root Execution**: Container explicitly executes with `user = "10001:10001"`.
+4. **Least-Privilege IAM Roles ([`terraform/iam.tf`](file:///c:/Users/dhana/asa-assignment/terraform/iam.tf))**:
+   - **ECS Execution Role**: Granted granular permission to fetch only the specific VulnTracker Secrets Manager secret ARN and decrypt with the specific KMS key ARN (`kms:Decrypt`, `secretsmanager:GetSecretValue`).
+   - **ECS Task Role**: Minimal runtime identity with zero infrastructure administrative permissions.
+
 ---
 
 ### Task 5 — Executive Summary _(~30 min)_

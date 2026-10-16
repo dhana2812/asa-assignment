@@ -21,6 +21,11 @@ This document serves as the master record and manual verification walkthrough fo
    - [Step-by-Step Manual Verification Walkthrough](#32-step-by-step-manual-verification-walkthrough)
    - [Automated Verification (Pytest 22/22 & Bandit SAST)](#33-automated-verification-pytest-and-bandit)
    - [Remediation Plan & Deferred Findings (`docs/remediation-plan.md`)](#34-remediation-plan--deferred-findings-summary)
+4. [Task 4: Containerisation & Deployment Artifacts — Verification & Results](#task-4-containerisation--deployment-artifacts--verification--results)
+   - [Dockerfile Security Architecture & Properties](#41-dockerfile-security-architecture--properties)
+   - [Manual Verification of Docker Build, Run, & Healthcheck](#42-manual-verification-of-docker-build-run--healthcheck)
+   - [Infrastructure-as-Code Cloud Deployment Architecture (`terraform/`)](#43-infrastructure-as-code-cloud-deployment-architecture-terraform)
+   - [Verification of Cloud Security Controls & Compliance](#44-verification-of-cloud-security-controls--compliance)
 
 ---
 
@@ -642,4 +647,163 @@ For all findings identified in Task 2 that were not remediated in code, comprehe
 | **VT-06** | **High-Severity CVEs in Dependencies** | **HIGH** | `requirements.txt`<br>`notify/` | Major version bumps require full regression testing across both services. ReDoS and memory corruption risks. | Container runs with non-root UID (`10001`), read-only rootfs (`readonlyRootFilesystem = true`), and dropped Linux capabilities (`drop = ["ALL"]`). |
 | **VT-09** | **Over-Permissive Outbound Egress** | **LOW** | `terraform/` | Outbound HTTPS allowed to external stakeholder webhook endpoints. | Zero inbound public access to tasks; non-interactive shell (`/sbin/nologin`). |
 | **VT-10** | **Base OS Image Debian CVEs** | **LOW** | `Dockerfile` | Upstream distribution patches. Theoretical privilege escalation. | Multi-stage build strips compilers; task executes with `no-new-privileges` under non-root user. |
+
+---
+
+# Task 4: Containerisation & Deployment Artifacts — Verification & Results
+
+## 4.1 Dockerfile Security Architecture & Properties
+
+The container specification in [`Dockerfile`](file:///c:/Users/dhana/asa-assignment/Dockerfile) was authored following strict DevSecOps and CIS Docker Benchmark principles:
+
+1. **Minimal, Pinned Base Image**:
+   - Uses `python:3.11-slim-bookworm` pinned to a specific Debian version, eliminating unnecessary binaries, documentation, and bloated OS packages.
+2. **Multi-Stage Build Pattern**:
+   - **Stage 1 (`builder`)**: Installs native C compilers (`gcc`, `libffi-dev`) required to compile wheels for `cryptography` and `bcrypt`, writing compiled artifacts to `/install/wheels`.
+   - **Stage 2 (`runtime`)**: Pulls a clean Debian base and copies only the compiled Python packages from `/install/wheels` to `/usr/local`. Compilers, package managers (`apt`), and temporary build caches are omitted from the production image, minimizing the attack surface.
+3. **Dedicated Non-Root User Execution**:
+   - Creates an explicit system group (`appgroup`, `GID 10001`) and system user (`appuser`, `UID 10001`) with no login shell (`/sbin/nologin`).
+   - The container executes strictly under `USER 10001:10001`, preventing container-breakout attacks from acquiring host root privileges.
+4. **Native In-Process `HEALTHCHECK`**:
+   - Employs Python's built-in standard library (`urllib.request`) rather than installing external utilities (`curl`, `wget`, `netcat`):
+     ```dockerfile
+     HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+         CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)" || exit 1
+     ```
+   - Automatically monitors service health and signals orchestrators (Docker, Kubernetes, AWS ECS) to recycle unhealthy instances.
+5. **Zero Hardcoded Secrets or Credentials**:
+   - No passwords, API keys, or secret tokens are present in the Dockerfile, layers, or environment variables. All secrets are injected dynamically at runtime via secrets management.
+
+---
+
+## 4.2 Manual Verification of Docker Build, Run, & Healthcheck
+
+Follow the step-by-step instructions below to build, run, and verify the containerized application.
+
+### Step 1: Build the Container Image
+Run the Docker build from the repository root:
+```powershell
+docker build -t vulntracker-api:latest .
+```
+- **Observed Result**: Multi-stage build completed successfully (`writing image sha256:... naming to docker.io/library/vulntracker-api:latest`).
+
+---
+
+### Step 2: Run the Hardened Container
+Run the container with a read-only root filesystem and an ephemeral tmpfs mount:
+```powershell
+docker run -d `
+  --name vulntracker-api `
+  -p 8000:8000 `
+  --read-only `
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m `
+  vulntracker-api:latest
+```
+
+---
+
+### Step 3: Verify Non-Root User Execution
+Inspect the runtime user inside the container:
+```powershell
+docker exec vulntracker-api id
+```
+- **Expected Output**:
+  ```text
+  uid=10001(appuser) gid=10001(appgroup) groups=10001(appgroup)
+  ```
+- Confirms the container is strictly running under unprivileged UID 10001, satisfying CIS Docker Benchmark 4.1.
+
+---
+
+### Step 4: Verify Container Healthcheck Status
+Check Docker daemon health status:
+```powershell
+docker ps -f name=vulntracker-api
+```
+- **Expected Output**:
+  ```text
+  CONTAINER ID   IMAGE                    STATUS                    PORTS                    NAMES
+  3b647b818468   vulntracker-api:latest   Up 35 seconds (healthy)   0.0.0.0:8000->8000/tcp   vulntracker-api
+  ```
+- Confirms the native `HEALTHCHECK` passes and Docker marks the container as `(healthy)`.
+
+---
+
+### Step 5: Test API Reachability and Endpoints
+Query the health check and Swagger documentation endpoints:
+```powershell
+# 1. Test health endpoint
+Invoke-RestMethod -Uri "http://localhost:8000/health"
+# Output: {"status":"ok","service":"vulntracker-api"}
+
+# 2. Test Swagger UI reachability
+$resp = Invoke-WebRequest -Uri "http://localhost:8000/docs"
+Write-Host "Swagger UI Status:" $resp.StatusCode
+# Output: 200
+```
+
+---
+
+### Step 6: Stop and Clean Up
+```powershell
+docker stop vulntracker-api ; docker rm vulntracker-api
+```
+
+---
+
+## 4.3 Infrastructure-as-Code Cloud Deployment Architecture (`terraform/`)
+
+The [`terraform/`](file:///c:/Users/dhana/asa-assignment/terraform/) directory provides complete cloud infrastructure to deploy the VulnTracker API to **AWS ECS Fargate**:
+
+| File | Purpose & Security Controls Implemented |
+| :--- | :--- |
+| [`terraform/main.tf`](file:///c:/Users/dhana/asa-assignment/terraform/main.tf) | Provisions ECS Cluster, CloudWatch log group with KMS encryption, Task Definition with pinned CPU/memory limits, read-only rootfs, dropped capabilities, and ECS Fargate service in private subnets. |
+| [`terraform/secrets.tf`](file:///c:/Users/dhana/asa-assignment/terraform/secrets.tf) | Creates AWS Secrets Manager secret for application credentials and a Customer-Managed KMS Key with automatic 30-day key rotation (`enable_key_rotation = true`). |
+| [`terraform/security_groups.tf`](file:///c:/Users/dhana/asa-assignment/terraform/security_groups.tf) | Configures least-privilege security groups: ALB restricted strictly to HTTPS (443); ECS tasks restricted strictly to ALB ingress on port 8000 with zero direct public access. |
+| [`terraform/iam.tf`](file:///c:/Users/dhana/asa-assignment/terraform/iam.tf) | Defines granular IAM execution and task roles. Grants permission strictly to the VulnTracker Secrets Manager secret ARN and KMS key ARN. |
+| [`terraform/variables.tf`](file:///c:/Users/dhana/asa-assignment/terraform/variables.tf) | Configures environment parameters (VPC ID, subnet IDs, CPU, memory, container image tag, port). |
+| [`terraform/outputs.tf`](file:///c:/Users/dhana/asa-assignment/terraform/outputs.tf) | Exports cluster name, service name, Secrets Manager secret ARN, and task security group ID. |
+
+---
+
+## 4.4 Verification of Cloud Security Controls & Compliance
+
+The infrastructure code was audited using Trivy IaC scanning and manually verified against all task requirements:
+
+### 1. Secret Management (Zero Hardcoded Credentials)
+- **Requirement**: Source secrets from a secrets manager (not hardcoded in manifests or env vars).
+- **Implementation**:
+  - `aws_secretsmanager_secret.app_secrets` stores `SECRET_KEY` and `DB_PASSWORD`.
+  - Encrypted with Customer Managed KMS Key (`aws_kms_key.secrets_key`).
+  - Injected into ECS container definition via direct Secrets Manager ARN references:
+    ```hcl
+    secrets = [
+      {
+        name      = "SECRET_KEY"
+        valueFrom = "${aws_secretsmanager_secret.app_secrets.arn}:SECRET_KEY::"
+      },
+      {
+        name      = "DB_PASSWORD"
+        valueFrom = "${aws_secretsmanager_secret.app_secrets.arn}:DB_PASSWORD::"
+      }
+    ]
+    ```
+  - `iam.tf` grants `secretsmanager:GetSecretValue` strictly scoped to the exact secret ARN (`Resource = [aws_secretsmanager_secret.app_secrets.arn]`).
+
+### 2. Network Ingress Restriction (Least Privilege)
+- **Requirement**: Restrict network ingress to only what is required.
+- **Implementation**:
+  - **ALB Security Group** (`aws_security_group.alb`): Ingress allowed only on HTTPS port 443 (`protocol = "tcp"`, `from_port = 443`, `to_port = 443`). Egress allowed strictly to the ECS task security group on container port 8000.
+  - **ECS Task Security Group** (`aws_security_group.ecs_tasks`): Ingress allowed **strictly from the ALB security group** (`security_groups = [aws_security_group.alb.id]`, `from_port = 8000`, `to_port = 8000`). **Zero public IP or internet ingress allowed**.
+  - Deployed across private subnets (`private_subnet_ids`).
+
+### 3. Resource Limits & Security Contexts
+- **Requirement**: Define resource limits and security contexts.
+- **Implementation**:
+  - **CPU & Memory Limits**: Pinned to `cpu = "256"` (0.25 vCPU) and `memory = "512"` (512 MiB), preventing resource starvation.
+  - **Read-Only Root Filesystem**: `readonlyRootFilesystem = true` prevents runtime filesystem manipulation, arbitrary file writes, or persistence of unauthorized executables.
+  - **Temporary Write Volume**: Ephemeral tmpfs volume mounted at `/tmp` for temporary files and SQLite operations.
+  - **Dropped Linux Capabilities**: `linuxParameters.capabilities.drop = ["ALL"]` strips all Linux kernel capabilities.
+  - **Non-Root Execution**: Explicitly enforced in task definition (`user = "10001:10001"`).
+
 
