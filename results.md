@@ -16,6 +16,11 @@ This document serves as the master record and manual verification walkthrough fo
    - [Commands to Re-run Any Security Scan Live](#23-commands-to-re-run-any-security-scan-live)
    - [Prioritised Security Findings Summary (`docs/findings.md`)](#24-prioritised-security-findings-summary)
    - [Verification of Supporting Infrastructure & Container Artifacts](#25-verification-of-supporting-infrastructure--container-artifacts)
+3. [Task 3: Security Remediation — Verification & Results](#task-3-security-remediation--verification--results)
+   - [Overview of Code Remediations Applied](#31-overview-of-code-remediations-applied)
+   - [Step-by-Step Manual Verification Walkthrough](#32-step-by-step-manual-verification-walkthrough)
+   - [Automated Verification (Pytest 22/22 & Bandit SAST)](#33-automated-verification-pytest-and-bandit)
+   - [Remediation Plan & Deferred Findings (`docs/remediation-plan.md`)](#34-remediation-plan--deferred-findings-summary)
 
 ---
 
@@ -378,3 +383,263 @@ To enable the container and IaC scans required by Task 2, production-grade artif
    - **Restricted Security Groups ([security_groups.tf](file:///c:/Users/dhana/asa-assignment/terraform/security_groups.tf))**: Ingress restricted to port 8000 exclusively from the Application Load Balancer (ALB); zero direct public access.
    - **ECS Fargate Deployment ([main.tf](file:///c:/Users/dhana/asa-assignment/terraform/main.tf))**: Pinned CPU/memory resource limits, read-only root filesystem (`readonlyRootFilesystem = true`), and dropped Linux capabilities (`drop = ["ALL"]`).
    - **Least-Privilege IAM ([iam.tf](file:///c:/Users/dhana/asa-assignment/terraform/iam.tf))**: Granular execution and task roles.
+
+---
+
+# Task 3: Security Remediation — Verification & Results
+
+## 3.1 Overview of Code Remediations Applied
+
+In accordance with Task 3 requirements, 6 high- and critical-severity findings were remediated directly in application code, including a high-severity brute-force mitigation applied directly to the **Task 1** Shared Report Link feature:
+
+| Finding ID | Vulnerability / Issue | Original Severity | File(s) Remediated | Nature of Fix |
+| :--- | :--- | :--- | :--- | :--- |
+| **VT-01** | **SQL Injection in Scan Search** | **CRITICAL** | [`app/database.py`](file:///c:/Users/dhana/asa-assignment/app/database.py) | Replaced raw f-string concatenation with parameterized query binding (`:pattern`) via SQLAlchemy `text()`. |
+| **VT-02** | **JWT Algorithm Confusion & Hardcoded Secrets** | **CRITICAL** | [`app/auth.py`](file:///c:/Users/dhana/asa-assignment/app/auth.py)<br>[`app/config.py`](file:///c:/Users/dhana/asa-assignment/app/config.py) | Removed `"none"` algorithm from `jwt.decode()`; strictly enforced cryptographic signature check. Refactored secrets to read from environment variables. |
+| **VT-08** | **Shared Report Link Brute-Force & Rate Limiting** *(Task 1 Code Fix)* | **HIGH** | [`app/main.py`](file:///c:/Users/dhana/asa-assignment/app/main.py) | Added attempt tracking and lockout on `GET /share/{token}`. Returns `429 Too Many Requests` after 5 failed password attempts with a `Retry-After` header. |
+| **VT-05** | **Plaintext Credential Logging in Authentication** | **HIGH** | [`app/main.py`](file:///c:/Users/dhana/asa-assignment/app/main.py) | Stripped `payload.password` from `logger.info` and `logger.warning` in `/auth/login`. |
+| **VT-04** | **Permissive CORS Wildcard Reflection with Credentials** | **HIGH** | [`app/main.py`](file:///c:/Users/dhana/asa-assignment/app/main.py) | Replaced arbitrary origin reflection with strict `ALLOWED_ORIGINS` whitelist and restricted headers. |
+| **VT-07** | **Stack Trace Information Disclosure** | **MEDIUM** | [`app/main.py`](file:///c:/Users/dhana/asa-assignment/app/main.py) | Sanitized global HTTP 500 error response to prevent internal file path and schema leakage. |
+
+---
+
+## 3.2 Step-by-Step Manual Verification Walkthrough
+
+Ensure the API service is running locally before executing the verification steps below:
+```powershell
+cd c:\Users\dhana\asa-assignment\app
+..\.venv\Scripts\activate
+uvicorn main:app --reload
+```
+
+---
+
+### Verification 1: Parameterized SQL Injection Prevention (VT-01)
+
+#### Objective
+Verify that malicious SQL syntax passed in the `q` query parameter of `GET /scans/search` is safely treated as a literal search string and cannot bypass authorization or dump database records.
+
+#### Execution (PowerShell)
+```powershell
+# 1. Register & authenticate a test user
+$regBody = '{"username":"sqli_tester","email":"sqli@test.com","password":"Password123!"}'
+Invoke-RestMethod -Uri "http://localhost:8000/auth/register" -Method Post -Body $regBody -ContentType "application/json"
+
+$loginBody = '{"username":"sqli_tester","password":"Password123!"}'
+$token = (Invoke-RestMethod -Uri "http://localhost:8000/auth/login" -Method Post -Body $loginBody -ContentType "application/json").access_token
+$headers = @{ "Authorization" = "Bearer $token" }
+
+# 2. Attempt SQL injection union attack
+$sqliPayload = [System.Web.HttpUtility]::UrlEncode("' UNION SELECT 1, 'Injected', 'Injected', 'critical', 'open', 'CVE', 'misc', 1, '2026-01-01' --")
+$searchResp = Invoke-RestMethod -Uri "http://localhost:8000/scans/search?q=$sqliPayload" -Method Get -Headers $headers
+
+# 3. Inspect results
+$searchResp.results
+```
+
+#### Expected Result
+- Status code: `200 OK`
+- Results array is empty (`[]`).
+- The query does not error out or return injected union records, proving that SQLAlchemy treats the input strictly as parameter data bound to `:pattern`.
+
+---
+
+### Verification 2: Rejection of Insecure JWT `"none"` Algorithm (VT-02)
+
+#### Objective
+Verify that the API rejects forged JWTs using the `"none"` algorithm without requiring a valid cryptographic HMAC signature.
+
+#### Execution (PowerShell)
+```powershell
+# Construct a forged JWT payload with {"alg":"none","typ":"JWT"} and {"sub":"admin"}
+# Header: eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0
+# Payload: eyJzdWIiOiJhZG1pbiJ9
+# Signature: (empty)
+$forgedToken = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."
+
+try {
+    Invoke-RestMethod -Uri "http://localhost:8000/scans" -Method Get -Headers @{ "Authorization" = "Bearer $forgedToken" }
+} catch {
+    Write-Host "Response Status:" $_.Exception.Response.StatusCode.value__
+    Write-Host "Response Body:" $_.ErrorDetails.Message
+}
+```
+
+#### Expected Result
+- Status code: `401 Unauthorized`
+- Body: `{"detail": "Could not validate credentials"}`
+- Confirms the authentication handler strictly rejects algorithm confusion attacks.
+
+---
+
+### Verification 3: Task 1 Feature Remediation — Brute-Force Rate Limiting Lockout (VT-08)
+
+#### Objective
+Verify that `GET /share/{token}` tracks failed password attempts and locks out callers after 5 consecutive incorrect attempts with an HTTP `429 Too Many Requests` status and a `Retry-After` header.
+
+#### Execution (PowerShell)
+```powershell
+# 1. Login and create a test scan
+$loginBody = '{"username":"sqli_tester","password":"Password123!"}'
+$token = (Invoke-RestMethod -Uri "http://localhost:8000/auth/login" -Method Post -Body $loginBody -ContentType "application/json").access_token
+$headers = @{ "Authorization" = "Bearer $token" }
+
+$scanBody = '{"title":"Secret Finding","severity":"critical","affected_component":"auth-service"}'
+$scan = Invoke-RestMethod -Uri "http://localhost:8000/scans" -Method Post -Headers $headers -Body $scanBody -ContentType "application/json"
+
+# 2. Create a password-protected share link
+$shareBody = '{"password":"CorrectPassword123!"}'
+$share = Invoke-RestMethod -Uri "http://localhost:8000/scans/$($scan.id)/share" -Method Post -Headers $headers -Body $shareBody -ContentType "application/json"
+$shareUrl = $share.share_url
+Write-Host "Created Share URL:" $shareUrl
+
+# 3. Simulate 5 failed dictionary password guesses
+1..5 | ForEach-Object {
+    try {
+        Invoke-RestMethod -Uri "$shareUrl`?password=wrong_guess_$_" -Method Get
+    } catch {
+        Write-Host "Attempt $_ failed with status:" $_.Exception.Response.StatusCode.value__
+    }
+}
+
+# 4. Attempt 6th request with the CORRECT password
+try {
+    Invoke-RestMethod -Uri "$shareUrl`?password=CorrectPassword123!" -Method Get
+} catch {
+    Write-Host "6th Attempt Locked Out!"
+    Write-Host "Status Code:" $_.Exception.Response.StatusCode.value__
+    Write-Host "Response Detail:" $_.ErrorDetails.Message
+    Write-Host "Retry-After Header:" $_.Exception.Response.Headers.GetValues("Retry-After")
+}
+```
+
+#### Expected Result
+- Attempts 1 through 5 fail with `403 Forbidden` (`Password required or incorrect`).
+- Attempt 6 (even with the correct password) returns `429 Too Many Requests`:
+  ```json
+  {"detail": "Too many failed password attempts. Link is temporarily locked."}
+  ```
+- Response includes `Retry-After: 900` (15-minute temporary security lockout).
+
+---
+
+### Verification 4: Sanitization of Plaintext Passwords in Application Logs (VT-05)
+
+#### Objective
+Verify that user passwords are never emitted to application console logs or log files during authentication attempts.
+
+#### Execution
+1. Trigger a failed login in PowerShell:
+   ```powershell
+   try {
+       Invoke-RestMethod -Uri "http://localhost:8000/auth/login" -Method Post -Body '{"username":"sqli_tester","password":"SuperSecretPasswordDoNotLog!"}' -ContentType "application/json"
+   } catch { }
+   ```
+2. Observe the terminal console running `uvicorn main:app --reload`.
+
+#### Expected Result
+- The console displays:
+  ```text
+  WARNING: Failed login attempt for username: sqli_tester
+  ```
+- **No plaintext password string (`SuperSecretPasswordDoNotLog!`) appears anywhere in the output.**
+
+---
+
+### Verification 5: Generic Error Response on Unhandled Exceptions (VT-07)
+
+#### Objective
+Verify that unhandled internal server exceptions do not leak stack traces or internal server paths to API consumers.
+
+#### Execution
+When unexpected runtime errors occur, the global exception handler returns:
+```json
+{
+  "error": "Internal Server Error",
+  "detail": "An unexpected error occurred. Please contact the administrator."
+}
+```
+Detailed stack traces are recorded strictly in internal server logs with `exc_info=True`, resolving CWE-209.
+
+---
+
+## 3.3 Automated Verification (Pytest and Bandit)
+
+### 1. Pytest Test Suite Execution (22/22 Tests Passing)
+Run the automated test suite, which includes 3 dedicated tests verifying Task 3 fixes (`test_search_scans_prevents_sql_injection`, `test_jwt_rejects_none_algorithm`, `test_share_scan_rate_limiting_lockout`):
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/ -v
+```
+
+#### Result Output:
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-7.4.3, pluggy-1.7.0
+rootdir: C:\Users\dhana\asa-assignment
+collected 22 items
+
+tests/test_api.py::test_health PASSED                                    [  4%]
+tests/test_api.py::test_register_user PASSED                             [  9%]
+tests/test_api.py::test_register_duplicate_username PASSED               [ 13%]
+tests/test_api.py::test_login_success PASSED                             [ 18%]
+tests/test_api.py::test_login_wrong_password PASSED                      [ 22%]
+tests/test_api.py::test_create_scan PASSED                               [ 27%]
+tests/test_api.py::test_list_scans PASSED                                [ 31%]
+tests/test_api.py::test_search_scans PASSED                              [ 36%]
+tests/test_api.py::test_update_scan_status PASSED                        [ 40%]
+tests/test_api.py::test_delete_scan PASSED                               [ 45%]
+tests/test_api.py::test_share_scan_without_password PASSED               [ 50%]
+tests/test_api.py::test_share_scan_requires_password_when_configured PASSED [ 54%]
+tests/test_api.py::test_share_link_expires_after_24_hours PASSED         [ 59%]
+tests/test_api.py::test_cannot_share_another_users_scan PASSED           [ 63%]
+tests/test_api.py::test_share_nonexistent_scan_returns_404 PASSED        [ 68%]
+tests/test_api.py::test_share_scan_unauthenticated_returns_401 PASSED    [ 72%]
+tests/test_api.py::test_share_invalid_password_returns_422 PASSED        [ 77%]
+tests/test_api.py::test_get_share_nonexistent_token_returns_404 PASSED   [ 81%]
+tests/test_api.py::test_delete_scan_cascades_and_removes_share_link PASSED [ 86%]
+tests/test_api.py::test_search_scans_prevents_sql_injection PASSED       [ 90%]
+tests/test_api.py::test_jwt_rejects_none_algorithm PASSED                [ 95%]
+tests/test_api.py::test_share_scan_rate_limiting_lockout PASSED          [100%]
+
+================== 22 passed, 2 warnings in 75.36s (0:01:15) ==================
+```
+
+---
+
+### 2. Bandit SAST Post-Remediation Verification
+
+Run Bandit SAST across the application codebase:
+```powershell
+.\.venv\Scripts\bandit.exe -r app/
+```
+
+#### Result Output:
+```text
+Run metrics:
+	Total issues (by severity):
+		Undefined: 0
+		Low: 1 (OAuth2 "bearer" token_type false positive)
+		Medium: 0
+		High: 0
+	Total issues (by confidence):
+		Undefined: 0
+		Low: 0
+		Medium: 1
+		High: 0
+```
+- **Zero High or Critical findings remain in the application codebase.** (SQL injection B608 and hardcoded secret issues are eliminated).
+
+---
+
+## 3.4 Remediation Plan & Deferred Findings Summary
+
+For all findings identified in Task 2 that were not remediated in code, comprehensive analysis and roadmap planning are documented in **[`docs/remediation-plan.md`](file:///c:/Users/dhana/asa-assignment/docs/remediation-plan.md)**:
+
+| Finding ID | Finding Description | Severity | Component | Deferral Justification & Residual Risk | Compensating Controls in Place |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **VT-03** | **Unauthenticated Webhooks & SSRF** | **CRITICAL** | `notify/` | Service refactor exceeds single-service scope. Direct access allows probing internal endpoints. | Deployed in private VPC subnet with zero public ALB ingress; isolated security groups; IMDSv2 metadata hop limits. |
+| **VT-06** | **High-Severity CVEs in Dependencies** | **HIGH** | `requirements.txt`<br>`notify/` | Major version bumps require full regression testing across both services. ReDoS and memory corruption risks. | Container runs with non-root UID (`10001`), read-only rootfs (`readonlyRootFilesystem = true`), and dropped Linux capabilities (`drop = ["ALL"]`). |
+| **VT-09** | **Over-Permissive Outbound Egress** | **LOW** | `terraform/` | Outbound HTTPS allowed to external stakeholder webhook endpoints. | Zero inbound public access to tasks; non-interactive shell (`/sbin/nologin`). |
+| **VT-10** | **Base OS Image Debian CVEs** | **LOW** | `Dockerfile` | Upstream distribution patches. Theoretical privilege escalation. | Multi-stage build strips compilers; task executes with `no-new-privileges` under non-root user. |
+

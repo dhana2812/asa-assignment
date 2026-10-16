@@ -28,30 +28,40 @@ app = FastAPI(
 )
 
 
+ALLOWED_ORIGINS = {
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://localhost:3001",
+}
+
+
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     response = await call_next(request)
     origin = request.headers.get("origin")
-    if origin:
+    # Strict CORS whitelist prevents arbitrary cross-origin data exfiltration (CWE-942)
+    if origin and origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
     return response
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled exception on %s: %s", request.url, exc)
+    # Log detailed traceback internally for diagnostics
+    logger.error("Unhandled exception on %s: %s", request.url, exc, exc_info=True)
+    # Sanitize client response to prevent internal information disclosure (CWE-209)
     return JSONResponse(
         status_code=500,
         content={
-            "error": str(exc),
-            "type": type(exc).__name__,
-            "traceback": traceback.format_exc(),
-            "path": str(request.url),
+            "error": "Internal Server Error",
+            "detail": "An unexpected error occurred. Please contact the administrator.",
         },
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +165,15 @@ def register(payload: UserRegister, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 def login(payload: UserLogin, db: Session = Depends(get_db)):
-    logger.info("Login attempt — username: %s password: %s", payload.username, payload.password)
+    # Do not log plaintext passwords (CWE-532)
+    logger.info("Login attempt for username: %s", payload.username)
     user = db.query(models.User).filter(models.User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
-        logger.warning(
-            "Failed login — username: '%s' password: '%s'",
-            payload.username,
-            payload.password,
-        )
+        logger.warning("Failed login attempt for username: %s", payload.username)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +261,13 @@ def create_share_link(
     return {"share_url": f"http://localhost:8000/share/{token}"}
 
 
+# In-memory attempt tracking for password-protected shared report links (VT-08 Remediation)
+# Maps token_hash -> {"failed_attempts": int, "locked_until": Optional[datetime]}
+_share_link_rate_limits: dict = {}
+MAX_SHARE_PASSWORD_ATTEMPTS = 5
+SHARE_LOCKOUT_MINUTES = 15
+
+
 @app.get(
     "/share/{token}",
     response_model=ScanOut,
@@ -268,18 +283,49 @@ def get_shared_scan(
     Publicly retrieve a shared scan finding using its unique share token.
     Enforces a strict 24-hour expiration window.
     If the link is password-protected, requires the correct `password` query parameter.
+    Includes rate-limiting lockout after 5 consecutive failed attempts to prevent brute-force attacks (VT-08).
     """
+    token_hash = _hash_share_token(token)
+    now = datetime.utcnow()
+
+    # Check if token is locked out due to excessive failed attempts
+    rate_data = _share_link_rate_limits.get(token_hash)
+    if rate_data and rate_data.get("locked_until") and rate_data["locked_until"] > now:
+        retry_seconds = int((rate_data["locked_until"] - now).total_seconds())
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed password attempts. Link is temporarily locked.",
+            headers={"Retry-After": str(max(retry_seconds, 1))},
+        )
+
     share_link = db.query(models.ShareLink).filter(
-        models.ShareLink.token_hash == _hash_share_token(token),
+        models.ShareLink.token_hash == token_hash,
     ).first()
-    if not share_link or share_link.expires_at <= datetime.utcnow():
+    if not share_link or share_link.expires_at <= now:
         raise HTTPException(status_code=404, detail="Share link not found or expired")
-    if share_link.password_hash is not None and (
-        password is None
-        or len(password.encode("utf-8")) > 72
-        or not verify_password(password, share_link.password_hash)
-    ):
-        raise HTTPException(status_code=403, detail="Password required or incorrect")
+
+    if share_link.password_hash is not None:
+        is_valid = False
+        if password is not None and 1 <= len(password.encode("utf-8")) <= 72:
+            is_valid = verify_password(password, share_link.password_hash)
+
+        if not is_valid:
+            if token_hash not in _share_link_rate_limits:
+                _share_link_rate_limits[token_hash] = {"failed_attempts": 0, "locked_until": None}
+            _share_link_rate_limits[token_hash]["failed_attempts"] += 1
+
+            if _share_link_rate_limits[token_hash]["failed_attempts"] >= MAX_SHARE_PASSWORD_ATTEMPTS:
+                _share_link_rate_limits[token_hash]["locked_until"] = now + timedelta(minutes=SHARE_LOCKOUT_MINUTES)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many failed password attempts. Link is temporarily locked.",
+                    headers={"Retry-After": str(SHARE_LOCKOUT_MINUTES * 60)},
+                )
+            raise HTTPException(status_code=403, detail="Password required or incorrect")
+
+        # Reset failed attempts upon successful password verification
+        if token_hash in _share_link_rate_limits:
+            _share_link_rate_limits.pop(token_hash, None)
 
     scan = db.query(models.ScanResult).filter(
         models.ScanResult.id == share_link.scan_id,

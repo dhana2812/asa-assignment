@@ -35,7 +35,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def decode_token(token: str) -> dict:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM, "none"])
+        # Strictly verify cryptographic signature using approved ALGORITHM; reject 'none' algorithm
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
     except JWTError as exc:
         logger.debug("JWT decode error: %s", exc)
@@ -44,6 +45,7 @@ def decode_token(token: str) -> dict:
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
 
 
 def get_current_user(

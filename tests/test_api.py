@@ -302,3 +302,46 @@ def test_delete_scan_cascades_and_removes_share_link():
     # Share link should now return 404
     assert client.get(path).status_code == 404
 
+
+def test_search_scans_prevents_sql_injection():
+    token = register_and_login()
+    # Attempt SQL injection via query parameter
+    sqli_payload = "' UNION SELECT 1, 'Injected', 'Injected', 'critical', 'open', 'CVE', 'misc', 1, '2026-01-01' --"
+    resp = client.get(f"/scans/search?q={sqli_payload}", headers=auth_headers(token))
+    assert resp.status_code == 200
+    # Parameterized query should treat the payload as literal string, returning 0 results
+    assert len(resp.json()["results"]) == 0
+
+
+def test_jwt_rejects_none_algorithm():
+    # Construct an unverified token with alg: none
+    fake_token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhbGljZSJ9."
+    resp = client.get("/scans", headers={"Authorization": f"Bearer {fake_token}"})
+    assert resp.status_code == 401
+
+
+def test_share_scan_rate_limiting_lockout():
+    token = register_and_login()
+    scan_id = client.post("/scans", json={
+        "title": "Rate Limit finding",
+        "severity": "high",
+        "affected_component": "api",
+    }, headers=auth_headers(token)).json()["id"]
+
+    share_url = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": "correct-pass"},
+        headers=auth_headers(token),
+    ).json()["share_url"]
+    path = share_url.removeprefix("http://localhost:8000")
+
+    # Send 5 failed attempts
+    for _ in range(5):
+        client.get(path, params={"password": "wrong-guess"})
+
+    # 6th attempt should be blocked by rate limiter with HTTP 429
+    blocked_resp = client.get(path, params={"password": "correct-pass"})
+    assert blocked_resp.status_code == 429
+    assert "Retry-After" in blocked_resp.headers
+
+

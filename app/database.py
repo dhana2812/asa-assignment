@@ -1,6 +1,5 @@
 from sqlalchemy import create_engine, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config import DATABASE_URL
 
@@ -18,12 +17,14 @@ def get_db():
 
 
 def search_scans_by_query(db, query: str) -> list:
-    # Raw SQL used here for full-text search flexibility across multiple columns
-    sql = (
-        f"SELECT id, title, description, severity, status, cve_id, "
-        f"affected_component, owner_id, created_at FROM scan_results "
-        f"WHERE title LIKE '%{query}%' OR description LIKE '%{query}%' "
-        f"OR cve_id LIKE '%{query}%'"
+    # Parameterized query using bind variables to eliminate SQL injection (CWE-89)
+    sql = text(
+        "SELECT id, title, description, severity, status, cve_id, "
+        "affected_component, owner_id, created_at FROM scan_results "
+        "WHERE title LIKE :pattern OR description LIKE :pattern "
+        "OR cve_id LIKE :pattern"
     )
-    result = db.execute(text(sql))
+    pattern = f"%{query}%"
+    result = db.execute(sql, {"pattern": pattern})
     return [dict(row._mapping) for row in result]
+
