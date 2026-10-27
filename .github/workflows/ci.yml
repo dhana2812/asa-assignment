@@ -74,16 +74,15 @@ jobs:
 
       - name: Run Bandit SAST scan
         run: |
+          # Generate full JSON report (--exit-zero so it never blocks the report step)
           bandit -r app/ \
             --format json \
             --output reports/sast.bandit.json \
             --severity-level medium \
-            || true
-          # Fail CI on HIGH or CRITICAL findings
+            --exit-zero
+          # Fail CI if any HIGH or CRITICAL findings exist
           bandit -r app/ \
-            --format json \
             --severity-level high \
-            --exit-zero-on-skips \
             --quiet
 
       - name: Upload SAST report
