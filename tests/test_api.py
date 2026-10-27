@@ -7,6 +7,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+# Set required env vars BEFORE importing app modules.
+# config.py raises RuntimeError if secrets are absent (VT-02 remediation).
+os.environ.setdefault("SECRET_KEY", "test-only-secret-key-not-for-production")
+os.environ.setdefault("DB_PASSWORD", "test-only-db-password")
+os.environ.setdefault("ADMIN_API_KEY", "test-only-admin-api-key")
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from database import Base, get_db  # noqa: E402
