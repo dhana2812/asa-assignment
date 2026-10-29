@@ -20,3 +20,9 @@ env/
 htmlcov/
 node_modules/
 .claude/
+
+# Terraform local artifacts
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

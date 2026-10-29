@@ -3,8 +3,8 @@
   "Trivy": {
     "Version": "0.76.0"
   },
-  "ReportID": "01a14524-5a3f-7368-b382-a51d503f2d00",
-  "CreatedAt": "2026-10-16T14:36:12.735226046Z",
+  "ReportID": "01a188a1-bb48-7c61-8a45-d9fc600334bd",
+  "CreatedAt": "2026-10-29T17:07:43.048813763Z",
   "ArtifactName": "/src/terraform",
   "ArtifactType": "filesystem",
   "Results": [
@@ -43,58 +43,90 @@
           ],
           "Status": "FAIL",
           "CauseMetadata": {
-            "Resource": "aws_security_group.ecs_tasks",
+            "Resource": "aws_vpc_security_group_egress_rule.tasks_https_out",
             "Provider": "AWS",
             "Service": "ec2",
-            "StartLine": 55,
-            "EndLine": 55,
+            "StartLine": 66,
+            "EndLine": 66,
             "Code": {
               "Lines": [
                 {
-                  "Number": 37,
-                  "Content": "resource \"aws_security_group\" \"ecs_tasks\" {",
+                  "Number": 60,
+                  "Content": "resource \"aws_vpc_security_group_egress_rule\" \"tasks_https_out\" {",
                   "IsCause": false,
                   "Annotation": "",
                   "Truncated": false,
-                  "Highlighted": "\u001b[38;5;33mresource\u001b[0m \u001b[38;5;37m\"aws_security_group\"\u001b[0m \u001b[38;5;37m\"ecs_tasks\"\u001b[0m {",
+                  "Highlighted": "\u001b[38;5;33mresource\u001b[0m \u001b[38;5;37m\"aws_vpc_security_group_egress_rule\"\u001b[0m \u001b[38;5;37m\"tasks_https_out\"\u001b[0m {",
                   "FirstCause": false,
                   "LastCause": false
-                },
-                {
-                  "Number": 38,
-                  "Content": "",
-                  "IsCause": false,
-                  "Annotation": "",
-                  "Truncated": true,
-                  "FirstCause": false,
-                  "LastCause": false
-                },
-                {
-                  "Number": 55,
-                  "Content": "    cidr_blocks = [\"0.0.0.0/0\"]",
-                  "IsCause": true,
-                  "Annotation": "",
-                  "Truncated": false,
-                  "Highlighted": "\u001b[0m    \u001b[38;5;245mcidr_blocks\u001b[0m = [\u001b[38;5;37m\"0.0.0.0/0\"\u001b[0m]",
-                  "FirstCause": true,
-                  "LastCause": true
                 },
                 {
                   "Number": 61,
-                  "Content": "",
+                  "Content": "  security_group_id = aws_security_group.ecs_tasks.id",
                   "IsCause": false,
                   "Annotation": "",
-                  "Truncated": true,
+                  "Truncated": false,
+                  "Highlighted": "  \u001b[38;5;245msecurity_group_id\u001b[0m = aws_security_group.ecs_tasks.id",
                   "FirstCause": false,
                   "LastCause": false
                 },
                 {
                   "Number": 62,
+                  "Content": "  description       = \"Allow outbound HTTPS for AWS APIs and webhook delivery\"",
+                  "IsCause": false,
+                  "Annotation": "",
+                  "Truncated": false,
+                  "Highlighted": "  \u001b[38;5;245mdescription\u001b[0m       = \u001b[38;5;37m\"Allow outbound HTTPS for AWS APIs and webhook delivery\"",
+                  "FirstCause": false,
+                  "LastCause": false
+                },
+                {
+                  "Number": 63,
+                  "Content": "  ip_protocol       = \"tcp\"",
+                  "IsCause": false,
+                  "Annotation": "",
+                  "Truncated": false,
+                  "Highlighted": "\u001b[0m  \u001b[38;5;245mip_protocol\u001b[0m       = \u001b[38;5;37m\"tcp\"",
+                  "FirstCause": false,
+                  "LastCause": false
+                },
+                {
+                  "Number": 64,
+                  "Content": "  from_port         = 443",
+                  "IsCause": false,
+                  "Annotation": "",
+                  "Truncated": false,
+                  "Highlighted": "\u001b[0m  \u001b[38;5;245mfrom_port\u001b[0m         = \u001b[38;5;37m443",
+                  "FirstCause": false,
+                  "LastCause": false
+                },
+                {
+                  "Number": 65,
+                  "Content": "  to_port           = 443",
+                  "IsCause": false,
+                  "Annotation": "",
+                  "Truncated": false,
+                  "Highlighted": "\u001b[0m  \u001b[38;5;245mto_port\u001b[0m           = \u001b[38;5;37m443",
+                  "FirstCause": false,
+                  "LastCause": false
+                },
+                {
+                  "Number": 66,
+                  "Content": "  cidr_ipv4         = \"0.0.0.0/0\"",
+                  "IsCause": true,
+                  "Annotation": "",
+                  "Truncated": false,
+                  "Highlighted": "\u001b[0m  \u001b[38;5;245mcidr_ipv4\u001b[0m         = \u001b[38;5;37m\"0.0.0.0/0\"",
+                  "FirstCause": true,
+                  "LastCause": true
+                },
+                {
+                  "Number": 67,
                   "Content": "}",
                   "IsCause": false,
                   "Annotation": "",
                   "Truncated": false,
-                  "Highlighted": "}",
+                  "Highlighted": "\u001b[0m}",
                   "FirstCause": false,
                   "LastCause": false
                 }
@@ -102,19 +134,11 @@
             },
             "Occurrences": [
               {
-                "Resource": "egress",
+                "Resource": "aws_vpc_security_group_egress_rule.tasks_https_out",
                 "Filename": "security_groups.tf",
                 "Location": {
-                  "StartLine": 50,
-                  "EndLine": 56
-                }
-              },
-              {
-                "Resource": "aws_security_group.ecs_tasks",
-                "Filename": "security_groups.tf",
-                "Location": {
-                  "StartLine": 37,
-                  "EndLine": 62
+                  "StartLine": 60,
+                  "EndLine": 67
                 }
               }
             ]
