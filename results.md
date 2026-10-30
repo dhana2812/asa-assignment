@@ -797,8 +797,9 @@ The infrastructure code was audited using Trivy IaC scanning and manually verifi
 ### 2. Network Ingress Restriction (Least Privilege)
 - **Requirement**: Restrict network ingress to only what is required.
 - **Implementation**:
-  - **ALB Security Group** (`aws_security_group.alb`): Ingress allowed only on HTTPS port 443 (`protocol = "tcp"`, `from_port = 443`, `to_port = 443`). Egress allowed strictly to the ECS task security group on container port 8000.
-  - **ECS Task Security Group** (`aws_security_group.ecs_tasks`): Ingress allowed **strictly from the ALB security group** (`security_groups = [aws_security_group.alb.id]`, `from_port = 8000`, `to_port = 8000`). **Zero public IP or internet ingress allowed**.
+  - **Decoupled Security Group Rules**: Decoupled into standalone `aws_vpc_security_group_*_rule` resources to eliminate Terraform dependency cycles.
+  - **ALB Security Group** (`aws_security_group.alb` & `aws_vpc_security_group_ingress_rule.alb_https_in`): Ingress allowed only on HTTPS port 443 (`ip_protocol = "tcp"`, `from_port = 443`, `to_port = 443`, `cidr_ipv4 = "0.0.0.0/0"`). Egress (`alb_to_tasks`) allowed strictly to the ECS task security group on container port 8000 via `referenced_security_group_id`.
+  - **ECS Task Security Group** (`aws_security_group.ecs_tasks` & `aws_vpc_security_group_ingress_rule.tasks_from_alb`): Ingress allowed **strictly from the ALB security group** (`referenced_security_group_id = aws_security_group.alb.id`, `from_port = 8000`, `to_port = 8000`). **Zero public IP or internet ingress allowed**.
   - Deployed across private subnets (`private_subnet_ids`).
 
 ### 3. Resource Limits & Security Contexts

@@ -176,7 +176,7 @@ The findings have been triaged, contextualized, and prioritised based on actual 
 
 ### VT-09: Over-Permissive Egress in Security Groups (terraform/security_groups.tf)
 - **Detected By**: IaC Security Scan (`trivy config` check AWS-0104).
-- **Location**: [`terraform/security_groups.tf:L50-L56`](file:///c:/Users/dhana/asa-assignment/terraform/security_groups.tf#L50-L56).
+- **Location**: [`terraform/security_groups.tf:L60-L67`](file:///c:/Users/dhana/asa-assignment/terraform/security_groups.tf#L60-L67).
 - **Assessed Severity**: **LOW / MEDIUM** (Scanner rates as Critical; operational context is Low/Medium).
 - **Technical Analysis**:
   The ECS task security group defines outbound egress to `0.0.0.0/0` on port 443. While HTTPS egress is standard for container pulling, AWS APIs, and outbound webhooks, defense-in-depth best practices recommend routing through private VPC Endpoints (PrivateLink) and a restricted egress proxy.
